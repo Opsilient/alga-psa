@@ -77,4 +77,9 @@ jobs:
           build-args: ${{ matrix.build_args }}
           labels: |
             org.opencontainers.image.revision=${{ inputs.ref }}
-      - run: echo "${{ matrix.name }} ghcr.io/opsilient/${{ matrix.name }}@${{ steps.push.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Report digest and compressed size
+        run: |
+          img="ghcr.io/opsilient/${{ matrix.name }}"
+          digest="${{ steps.push.outputs.digest }}"
+          size=$(docker buildx imagetools inspect --raw "$img@$digest" | jq '[.layers[].size] | add')
+          echo "${{ matrix.name }}:${SHORT_TAG}@${digest} compressed=${size} bytes" >> "$GITHUB_STEP_SUMMARY"
