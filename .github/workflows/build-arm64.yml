@@ -1,0 +1,80 @@
+# Opsilient: native arm64 builds of the upstream AlgaPSA images (upstream only publishes amd64).
+# Builds straight from the Nine-Minds/alga-psa commit/tag given as input; this fork's own tree
+# is not used. All three packages must stay PRIVATE on GHCR (the EE licence forbids distribution).
+#
+# Only patch applied on top of the unchanged upstream tree: the workflow-worker Dockerfile gets
+# NODE_OPTIONS=--max-old-space-size=4096 in its builder stage (tsc OOMs at node's default ~2 GB);
+# upstream's Dockerfile at 016e0afc sets no heap size and takes no build arg for it. The step is
+# skipped if upstream starts setting max-old-space-size itself.
+name: Build arm64 images
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "upstream commit SHA or tag to build"
+        required: true
+        default: "016e0afc88fb784587b3ebe51fc64a2d30ffc0a9"
+permissions:
+  contents: read
+  packages: write
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: alga-psa-ee
+            file: ee/server/Dockerfile.build
+            # same knob the vendor's own CI and scripts/set-image-tag.sh pass
+            build_args: |
+              NEXT_BUILD_MAX_OLD_SPACE_SIZE=12288
+          - name: alga-workflow-worker
+            file: services/workflow-worker/Dockerfile
+            build_args: ""
+          - name: alga-email-service
+            file: services/email-service/Dockerfile
+            build_args: ""
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Nine-Minds/alga-psa
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Free disk space (EE build needs 10+ GB intermediate)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/share/powershell \
+            /usr/local/lib/node_modules /usr/share/swift || true
+          sudo docker image prune -af >/dev/null || true
+          df -h /
+      - name: Tag = short SHA of the checked-out upstream commit (set-image-tag.sh convention)
+        run: echo "SHORT_TAG=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_ENV"
+      - name: Patch workflow-worker builder heap (tsc OOMs at default 2 GB)
+        if: matrix.name == 'alga-workflow-worker'
+        run: |
+          if grep -q 'max-old-space-size' services/workflow-worker/Dockerfile; then
+            echo "upstream already sets a heap size; no patch needed"
+          else
+            sed -i '1a ENV NODE_OPTIONS=--max-old-space-size=4096' services/workflow-worker/Dockerfile
+            head -3 services/workflow-worker/Dockerfile
+          fi
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.file }}
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          tags: ghcr.io/opsilient/${{ matrix.name }}:${{ env.SHORT_TAG }}
+          build-args: ${{ matrix.build_args }}
+          labels: |
+            org.opencontainers.image.revision=${{ inputs.ref }}
+      - run: echo "${{ matrix.name }} ghcr.io/opsilient/${{ matrix.name }}@${{ steps.push.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
