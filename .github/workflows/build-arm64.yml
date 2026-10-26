@@ -264,7 +264,7 @@ jobs:
               # Dockerfile.build image: missing ee/server/src; vendor packaging: @alga-psa/db exports are
               # import-only) -- logged for information, not gated.
               docker run --rm --entrypoint sh "$IMG" -c 'cd /app && timeout 60 npx --no-install tsx server/scripts/create-tenant.ts --help 2>&1 | grep -m3 -E "Error|Usage"' || true
-              run next-start 'cd /app/server && (timeout 60 npx --no-install next start -p 3000 &) ; for i in $(seq 1 30); do sleep 2; curl -s -o /dev/null -w "HTTP %{http_code}\n" --max-time 20 http://127.0.0.1:3000/auth/signin && break; done; curl -s -o /dev/null -w "HTTP %{http_code}\n" --max-time 20 http://127.0.0.1:3000/api/healthz; sleep 3'
+              run next-start 'cd /app/server && (timeout 60 npx --no-install next start -p 3000 &) ; for i in $(seq 1 30); do sleep 2; curl -s -o /dev/null -w "HTTP %{http_code}\n" --max-time 20 http://127.0.0.1:3000/auth/signin && break; done; curl -s -o /dev/null -w "HTTP %{http_code}\n" --max-time 20 http://127.0.0.1:3000/api/healthz; curl -sf -o /dev/null --max-time 20 http://127.0.0.1:3000/auth/signin || { echo "next did not serve /auth/signin"; exit 1; }; sleep 3'
               ;;
             alga-workflow-worker)
               run node-resolve 'cd /app/services/workflow-worker && node -e "for (const m of [\"@temporalio/worker\",\"knex\",\"pg\",\"redis\",\"openai\"]) require.resolve(m); console.log(\"ok\")"'
@@ -297,5 +297,4 @@ jobs:
           comp=$(docker buildx imagetools inspect --raw "$IMG" | jq '[.layers[].size] | add')
           digest=$(docker image inspect -f '{{index .RepoDigests 0}}' "$IMG")
           docker history "$IMG" --format '{{.Size}}\t{{.CreatedBy}}' | cut -c1-160 | head -40
-          docker run --rm --entrypoint sh -u 0 "$IMG" -c 'du -xs /app/* /app/node_modules/* /app/node_modules/@*/* /app/*/*/node_modules 2>/dev/null | sort -n | tail -25' || true
           awk -v d="$digest" -v u="$size" -v c="$comp" 'BEGIN { printf "%s uncompressed=%.2f GB compressed=%.2f GB\n", d, u/1e9, c/1e9 }' | tee -a "$GITHUB_STEP_SUMMARY"
