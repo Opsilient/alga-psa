@@ -72,6 +72,10 @@ jobs:
       # smoke-tested and pushed without a second copy, and later builds can `FROM` them.
       DOCKER_BUILDKIT: "1"
       LABEL: org.opencontainers.image.revision=${{ inputs.ref }}
+      # Two root prod deps that no runtime code imports in full: @openai/codex is a developer CLI (~310 MB,
+      # nothing requires it), ffprobe-static ships ffprobe for 7 OS/arch pairs (~340 MB); only this
+      # platform's binary is kept (packages/documents' video handler uses it). Run from /app after install.
+      NM_TRIM: rm -rf node_modules/@openai/codex node_modules/@openai/codex-* && for d in node_modules/ffprobe-static/bin/*/*; do case "$d" in */linux/$(node -p process.arch)) ;; *) rm -rf "$d";; esac; done
     steps:
       - uses: actions/checkout@v4
         with:
@@ -138,7 +142,9 @@ jobs:
           df="$RUNNER_TEMP/Dockerfile.ee"
           # Keep the runtime settings Dockerfile.build's final stage had and ee/server/Dockerfile lacks
           # (ENV only adds metadata; the sed is a few-byte layer).
-          { cat ee/server/Dockerfile; cat <<'EOF'
+          install='RUN npm install --omit=dev --legacy-peer-deps'
+          [ "$(grep -cx "$install" ee/server/Dockerfile)" = 1 ] || { echo "::error::expected exactly one '$install' in ee/server/Dockerfile"; exit 1; }
+          { awk -v i="$install" -v t="$NM_TRIM" '$0 == i { print $0 " && " t; next } { print }' ee/server/Dockerfile; cat <<'EOF'
           # opsilient: parity with ee/server/Dockerfile.build's runtime stage
           ENV NEXT_PUBLIC_EDITION=enterprise SECRET_READ_CHAIN="env,filesystem" SECRET_WRITE_PROVIDER="filesystem"
           RUN sed -i 's/NEXT_PUBLIC_EDITION=community/NEXT_PUBLIC_EDITION=enterprise/' /app/.env /app/server/.env
@@ -171,7 +177,8 @@ jobs:
           RUN set -e; keep=" $keep "; \
               find . -mindepth 2 -path '*/node_modules' -prune -o -name package.json -print | sed 's|^\./||' \
                 | while read -r f; do case "\$keep" in *" \$f "*) ;; *) mv "\$f" "\$f.opsilient-hidden";; esac; done; \
-              npm prune --omit=dev $ws; \
+              npm prune --omit=dev --include-workspace-root $ws; \
+              $NM_TRIM; \
               find . -path '*/node_modules' -prune -o -name package.json.opsilient-hidden -print | while read -r f; do mv "\$f" "\${f%.opsilient-hidden}"; done; \
               npm cache clean --force; rm -rf /root/.npm /tmp/*
 
