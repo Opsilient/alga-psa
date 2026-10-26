@@ -250,7 +250,13 @@ jobs:
               run files 'set -e; cd /app/server; for f in setup/create_database.js knexfile.cjs scripts/create-tenant.ts .next/BUILD_ID next.config.mjs /app/entrypoint.sh /app/packages/core/dist/index.js /app/packages/db/dist/index.js; do test -e "$f" || { echo "No such file: $f"; exit 1; }; done; test -d migrations/utils; ls migrations | wc -l'
               run modules 'cd /app/server && node -e "for (const m of [\"next\",\"knex\",\"pg\",\"react\",\"react-dom\"]) require.resolve(m); console.log(\"ok\")" && npx --no-install knex --version && npx --no-install tsx --version'
               run setup-create-db 'cd /app/server && timeout 20 node setup/create_database.js' allow-exit
-              run create-tenant-loads 'cd /app && timeout 60 npx --no-install tsx server/scripts/create-tenant.ts --help' allow-exit
+              # Tenant bootstrap: upstream's helm bootstrap runs appliance-create-tenant.mjs (Temporal client
+              # only); it must get as far as its own input validation.
+              run appliance-create-tenant 'cd /app/server && timeout 20 node scripts/appliance-create-tenant.mjs; echo "exit $?"' allow-exit
+              # server/scripts/create-tenant.ts via tsx does not load in upstream's images either (the old
+              # Dockerfile.build image: missing ee/server/src; vendor packaging: @alga-psa/db exports are
+              # import-only) -- logged for information, not gated.
+              docker run --rm --entrypoint sh "$IMG" -c 'cd /app && timeout 60 npx --no-install tsx server/scripts/create-tenant.ts --help 2>&1 | grep -m3 -E "Error|Usage"' || true
               run next-start 'cd /app/server && (timeout 60 npx --no-install next start -p 3000 &) ; for i in $(seq 1 30); do sleep 2; curl -s -o /dev/null -w "HTTP %{http_code}\n" --max-time 20 http://127.0.0.1:3000/auth/signin && break; done; curl -s -o /dev/null -w "HTTP %{http_code}\n" --max-time 20 http://127.0.0.1:3000/api/healthz; sleep 3'
               ;;
             alga-workflow-worker)
