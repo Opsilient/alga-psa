@@ -1,6 +1,6 @@
 # Opsilient: native arm64 builds of the upstream AlgaPSA images (upstream only publishes amd64).
 # Builds straight from the Nine-Minds/alga-psa commit/tag given as input; this fork's own tree
-# is not used. All three packages must stay PRIVATE on GHCR (the EE licence forbids distribution).
+# is not used. All four packages must stay PRIVATE on GHCR (the EE licence forbids distribution).
 #
 # Only patch applied on top of the unchanged upstream tree: the workflow-worker Dockerfile gets
 # NODE_OPTIONS=--max-old-space-size=4096 in its builder stage (tsc OOMs at node's default ~2 GB);
@@ -14,27 +14,45 @@ on:
         description: "upstream commit SHA or tag to build"
         required: true
         default: "016e0afc88fb784587b3ebe51fc64a2d30ffc0a9"
+      images:
+        description: "comma-separated subset of: alga-psa-ee,alga-workflow-worker,alga-email-service,alga-temporal-worker"
+        required: true
+        default: "alga-psa-ee,alga-workflow-worker,alga-email-service,alga-temporal-worker"
 permissions:
   contents: read
   packages: write
 jobs:
+  plan:
+    # Matrix = the known images filtered by the `images` input (a job-level `if` cannot see `matrix`).
+    # build_args / target mirror the vendor's own compose/CI: NEXT_BUILD_MAX_OLD_SPACE_SIZE is the knob
+    # scripts/set-image-tag.sh passes; temporal-worker is docker-compose.ee.yaml's context=., target=production.
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        env:
+          IMAGES: ${{ inputs.images }}
+        run: |
+          all='[
+            {"name":"alga-psa-ee",          "file":"ee/server/Dockerfile.build",         "target":"",           "build_args":"NEXT_BUILD_MAX_OLD_SPACE_SIZE=12288"},
+            {"name":"alga-workflow-worker", "file":"services/workflow-worker/Dockerfile", "target":"",           "build_args":""},
+            {"name":"alga-email-service",   "file":"services/email-service/Dockerfile",   "target":"",           "build_args":""},
+            {"name":"alga-temporal-worker", "file":"ee/temporal-workflows/Dockerfile",    "target":"production", "build_args":""}
+          ]'
+          want=$(printf '%s' "$IMAGES" | tr -d ' \n' | jq -Rsc 'split(",") | map(select(. != ""))')
+          unknown=$(jq -nc --argjson w "$want" --argjson a "$all" '$w - ($a | map(.name))')
+          [ "$unknown" = "[]" ] || { echo "unknown image(s): $unknown" >&2; exit 1; }
+          [ "$want" != "[]" ] || { echo "images input is empty" >&2; exit 1; }
+          matrix=$(jq -c --argjson w "$want" '{include: map(select(.name as $n | $w | index($n)))}' <<<"$all")
+          echo "building: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
   build:
+    needs: plan
     runs-on: ubuntu-24.04-arm
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - name: alga-psa-ee
-            file: ee/server/Dockerfile.build
-            # same knob the vendor's own CI and scripts/set-image-tag.sh pass
-            build_args: |
-              NEXT_BUILD_MAX_OLD_SPACE_SIZE=12288
-          - name: alga-workflow-worker
-            file: services/workflow-worker/Dockerfile
-            build_args: ""
-          - name: alga-email-service
-            file: services/email-service/Dockerfile
-            build_args: ""
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -70,6 +88,7 @@ jobs:
         with:
           context: .
           file: ${{ matrix.file }}
+          target: ${{ matrix.target }}
           platforms: linux/arm64
           push: true
           provenance: false
