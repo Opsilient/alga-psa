@@ -158,14 +158,26 @@ jobs:
           # Same workspace set the Dockerfile installed, minus `server` (the builder rm -rf's it).
           ws=$(grep -o -- '--workspace=[^ ]*' "$src" | grep -vx -- '--workspace=server' | sort -u | tr '\n' ' ')
           [ -n "$ws" ] || { echo "::error::no --workspace flags found in $src"; exit 1; }
-          awk -v ws="$ws" '
-            /^FROM .+ AS runtime$/ {
-              print "# opsilient: drop devDependencies (and the npm cache) before the runtime COPY"
-              print "FROM builder AS opsilient-pruned"
-              print "WORKDIR /app"
-              print "RUN npm prune --omit=dev --include-workspace-root " ws " && npm cache clean --force && rm -rf /root/.npm /tmp/*"
-              print ""
-            }
+          # npm resolves every workspace manifest on disk. The builder later COPYs all of packages/, whose
+          # extra manifests (e.g. packages/emulators/threecx -> @alga-psa/ee-threecx, not in the context)
+          # make prune hit the registry and 404. Hide every manifest the Dockerfile did NOT copy before
+          # its install, prune, then restore them.
+          keep=$(grep -oE '^COPY [^ ]+/package\.json ' "$src" | awk '{print $2}' | tr '\n' ' ')
+          [ -n "$keep" ] || { echo "::error::no pre-install package.json COPYs found in $src"; exit 1; }
+          cat > "$RUNNER_TEMP/stage" <<EOF
+          # opsilient: drop devDependencies (and the npm cache) before the runtime COPY
+          FROM builder AS opsilient-pruned
+          WORKDIR /app
+          RUN set -e; keep=" $keep "; \
+              find . -mindepth 2 -path '*/node_modules' -prune -o -name package.json -print | sed 's|^\./||' \
+                | while read -r f; do case "\$keep" in *" \$f "*) ;; *) mv "\$f" "\$f.opsilient-hidden";; esac; done; \
+              npm prune --omit=dev --include-workspace-root $ws; \
+              find . -path '*/node_modules' -prune -o -name package.json.opsilient-hidden -print | while read -r f; do mv "\$f" "\${f%.opsilient-hidden}"; done; \
+              npm cache clean --force; rm -rf /root/.npm /tmp/*
+
+          EOF
+          awk -v stagefile="$RUNNER_TEMP/stage" '
+            /^FROM .+ AS runtime$/ { while ((getline l < stagefile) > 0) print l }
             $0 == "COPY --from=builder /app /app" { print "COPY --from=opsilient-pruned /app /app"; next }
             { print }' "$src" > "$df"
           diff "$src" "$df" || true
@@ -213,7 +225,7 @@ jobs:
       # ---- smoke tests: fail before push if the slim image cannot load its runtime ----
       - name: Smoke test
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           bad='Cannot find module|ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND|ERR_PACKAGE_PATH_NOT_EXPORTED|ERR_DLOPEN_FAILED|command not found|: not found|No such file'
           fail=0
           # run <label> <shell script>: runs inside the image with junk DB/Redis/Temporal endpoints;
