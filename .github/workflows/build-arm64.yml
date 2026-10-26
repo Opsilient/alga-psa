@@ -53,7 +53,6 @@ jobs:
             echo "== outside /app"; du -xs /usr /opt /var /root 2>/dev/null'
   plan:
     if: ${{ !inputs.diagnose }}
-  plan:
     # Matrix = the known images filtered by the `images` input (a job-level `if` cannot see `matrix`).
     # build_args / target mirror the vendor's own compose/CI: NEXT_BUILD_MAX_OLD_SPACE_SIZE is the knob
     # scripts/set-image-tag.sh passes; temporal-worker is docker-compose.ee.yaml's context=., target=production.
