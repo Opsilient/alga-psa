@@ -2,10 +2,22 @@
 # Builds straight from the Nine-Minds/alga-psa commit/tag given as input; this fork's own tree
 # is not used. All four packages must stay PRIVATE on GHCR (the EE licence forbids distribution).
 #
-# Only patch applied on top of the unchanged upstream tree: the workflow-worker Dockerfile gets
-# NODE_OPTIONS=--max-old-space-size=4096 in its builder stage (tsc OOMs at node's default ~2 GB);
-# upstream's Dockerfile at 016e0afc sets no heap size and takes no build arg for it. The step is
-# skipped if upstream starts setting max-old-space-size itself.
+# The upstream tree is never modified except for one guarded in-tree patch: the workflow-worker
+# Dockerfile gets NODE_OPTIONS=--max-old-space-size=4096 in its builder stage (tsc OOMs at node's
+# default ~2 GB; upstream sets no heap size and takes no build arg). Every other slimming step works on
+# Dockerfile COPIES in $RUNNER_TEMP (upstream file + a few appended/inserted lines), so the vendor's
+# Dockerfiles are still what builds the images:
+#   alga-psa-ee           Dockerfile.build's `builder` stage compiles the app (exported, no node_modules),
+#                         then the vendor's own packaging Dockerfile ee/server/Dockerfile (what upstream
+#                         publishes as ghcr.io/nine-minds/alga-psa-ee) installs --omit=dev deps around it.
+#                         Dockerfile.build's runtime stage shipped the full dev install twice (/app and
+#                         /app/server node_modules, ~11.5 GB).
+#   alga-workflow-worker  `npm prune --omit=dev` (same --workspace set the Dockerfile installed) in an
+#   alga-email-service    inserted stage just before the runtime stage's `COPY --from=builder /app /app`.
+#   alga-temporal-worker  `production` target flattened into one layer: its `chown -R /app` rewrote the
+#                         whole tree into a second layer, plus a 330 MB /root/.npm cache. Image config
+#                         (ENV/USER/WORKDIR/HEALTHCHECK/CMD...) is regenerated from the built image.
+# Each image is smoke-tested (critical files + modules resolve, entrypoints start) before it is pushed.
 name: Build arm64 images
 on:
   workflow_dispatch:
@@ -18,14 +30,16 @@ on:
         description: "comma-separated subset of: alga-psa-ee,alga-workflow-worker,alga-email-service,alga-temporal-worker"
         required: true
         default: "alga-psa-ee,alga-workflow-worker,alga-email-service,alga-temporal-worker"
+      tag_suffix:
+        description: "appended to the short-SHA tag (e.g. -slim for test builds); empty = normal tag"
+        required: false
+        default: ""
 permissions:
   contents: read
   packages: write
 jobs:
   plan:
     # Matrix = the known images filtered by the `images` input (a job-level `if` cannot see `matrix`).
-    # build_args / target mirror the vendor's own compose/CI: NEXT_BUILD_MAX_OLD_SPACE_SIZE is the knob
-    # scripts/set-image-tag.sh passes; temporal-worker is docker-compose.ee.yaml's context=., target=production.
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
@@ -35,10 +49,10 @@ jobs:
           IMAGES: ${{ inputs.images }}
         run: |
           all='[
-            {"name":"alga-psa-ee",          "file":"ee/server/Dockerfile.build",         "target":"",           "build_args":"NEXT_BUILD_MAX_OLD_SPACE_SIZE=12288"},
-            {"name":"alga-workflow-worker", "file":"services/workflow-worker/Dockerfile", "target":"",           "build_args":""},
-            {"name":"alga-email-service",   "file":"services/email-service/Dockerfile",   "target":"",           "build_args":""},
-            {"name":"alga-temporal-worker", "file":"ee/temporal-workflows/Dockerfile",    "target":"production", "build_args":""}
+            {"name":"alga-psa-ee",          "file":"ee/server/Dockerfile.build",         "slim":"ee-package"},
+            {"name":"alga-workflow-worker", "file":"services/workflow-worker/Dockerfile", "slim":"prune"},
+            {"name":"alga-email-service",   "file":"services/email-service/Dockerfile",   "slim":"prune"},
+            {"name":"alga-temporal-worker", "file":"ee/temporal-workflows/Dockerfile",    "slim":"flatten"}
           ]'
           want=$(printf '%s' "$IMAGES" | tr -d ' \n' | jq -Rsc 'split(",") | map(select(. != ""))')
           unknown=$(jq -nc --argjson w "$want" --argjson a "$all" '$w - ($a | map(.name))')
@@ -53,6 +67,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      # Plain docker driver (no setup-buildx): built images land straight in the daemon, so they can be
+      # smoke-tested and pushed without a second copy, and later builds can `FROM` them.
+      DOCKER_BUILDKIT: "1"
+      LABEL: org.opencontainers.image.revision=${{ inputs.ref }}
+      # Two root prod deps that no runtime code imports in full: @openai/codex is a developer CLI (~310 MB,
+      # nothing requires it), ffprobe-static ships ffprobe for 7 OS/arch pairs (~340 MB); only this
+      # platform's binary is kept (packages/documents' video handler uses it). Run from /app after install.
+      NM_TRIM: rm -rf node_modules/@openai/codex node_modules/@openai/codex-* && for d in node_modules/ffprobe-static/bin/*/*; do case "$d" in */linux/$(node -p process.arch)) ;; *) rm -rf "$d";; esac; done
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,8 +89,12 @@ jobs:
             /usr/local/lib/node_modules /usr/share/swift || true
           sudo docker image prune -af >/dev/null || true
           df -h /
-      - name: Tag = short SHA of the checked-out upstream commit (set-image-tag.sh convention)
-        run: echo "SHORT_TAG=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_ENV"
+      - name: Tag = short SHA of the checked-out upstream commit (set-image-tag.sh convention) + suffix
+        env:
+          SUFFIX: ${{ inputs.tag_suffix }}
+        run: |
+          [[ "$SUFFIX" =~ ^[A-Za-z0-9._-]*$ ]] || { echo "bad tag_suffix" >&2; exit 1; }
+          echo "IMG=ghcr.io/opsilient/${{ matrix.name }}:$(git rev-parse --short=8 HEAD)$SUFFIX" >> "$GITHUB_ENV"
       - name: Patch workflow-worker builder heap (tsc OOMs at default 2 GB)
         if: matrix.name == 'alga-workflow-worker'
         run: |
@@ -77,28 +104,197 @@ jobs:
             sed -i '1a ENV NODE_OPTIONS=--max-old-space-size=4096' services/workflow-worker/Dockerfile
             head -3 services/workflow-worker/Dockerfile
           fi
-      - uses: docker/setup-buildx-action@v3
+
+      # ---- alga-psa-ee: compile with Dockerfile.build, package with the vendor's ee/server/Dockerfile ----
+      - name: "ee: compile (Dockerfile.build builder stage) and export the build outputs"
+        if: matrix.slim == 'ee-package'
+        run: |
+          set -euo pipefail
+          grep -qx 'FROM deps AS builder' "${{ matrix.file }}" || { echo "::error::builder stage not found in ${{ matrix.file }}"; exit 1; }
+          df="$RUNNER_TEMP/Dockerfile.ee-artifacts"
+          # Export everything the builder generates (Next build, workspace dists, generated src/public
+          # files) without node_modules or the Next build cache. tar, not COPY globs: COPY would flatten
+          # packages/*/dist into one directory.
+          { cat "${{ matrix.file }}"; cat <<'EOF'
+          FROM builder AS opsilient-artifacts-pre
+          RUN mkdir /out && cd /app \
+              && tar -cf - --exclude=node_modules --exclude=server/.next/cache \
+                   server/.next server/public server/src shared/dist $(ls -d packages/*/dist ee/packages/*/dist) \
+               | tar -xf - -C /out
+          FROM scratch AS opsilient-artifacts
+          COPY --from=opsilient-artifacts-pre /out/ /
+          EOF
+          } > "$df"
+          docker build -f "$df" --target opsilient-artifacts \
+            --build-arg NEXT_BUILD_MAX_OLD_SPACE_SIZE=12288 \
+            --output "type=local,dest=$RUNNER_TEMP/ee-out" .
+          du -sh "$RUNNER_TEMP"/ee-out/* "$RUNNER_TEMP"/ee-out/server/* | sort -h | tail
+          # Overlay the build outputs onto the checkout: this is exactly the "pre-built artifacts in the
+          # context" layout ee/server/Dockerfile expects (its .dockerignore whitelists which dists ship).
+          cp -a "$RUNNER_TEMP/ee-out/." .
+          rm -rf "$RUNNER_TEMP/ee-out"
+          docker builder prune -af >/dev/null
+          df -h /
+      - name: "ee: package with ee/server/Dockerfile"
+        if: matrix.slim == 'ee-package'
+        run: |
+          set -euo pipefail
+          df="$RUNNER_TEMP/Dockerfile.ee"
+          # Keep the runtime settings Dockerfile.build's final stage had and ee/server/Dockerfile lacks
+          # (ENV only adds metadata; the sed is a few-byte layer).
+          install='RUN npm install --omit=dev --legacy-peer-deps'
+          [ "$(grep -cx "$install" ee/server/Dockerfile)" = 1 ] || { echo "::error::expected exactly one '$install' in ee/server/Dockerfile"; exit 1; }
+          { awk -v i="$install" -v t="$NM_TRIM" '$0 == i { print $0 " && " t; next } { print }' ee/server/Dockerfile; cat <<'EOF'
+          # opsilient: parity with ee/server/Dockerfile.build's runtime stage
+          ENV NEXT_PUBLIC_EDITION=enterprise SECRET_READ_CHAIN="env,filesystem" SECRET_WRITE_PROVIDER="filesystem"
+          RUN sed -i 's/NEXT_PUBLIC_EDITION=community/NEXT_PUBLIC_EDITION=enterprise/' /app/.env /app/server/.env
+          EOF
+          } > "$df"
+          docker build -f "$df" --label "$LABEL" -t "$IMG" .
+
+      # ---- workflow-worker / email-service: prune devDependencies before the runtime COPY ----
+      - name: "prune: build with npm prune --omit=dev before the runtime stage"
+        if: matrix.slim == 'prune'
+        run: |
+          set -euo pipefail
+          src="${{ matrix.file }}"
+          df="$RUNNER_TEMP/Dockerfile.pruned"
+          [ "$(grep -cx 'COPY --from=builder /app /app' "$src")" = 1 ] || { echo "::error::expected exactly one 'COPY --from=builder /app /app' in $src"; exit 1; }
+          [ "$(grep -cE '^FROM .+ AS runtime$' "$src")" = 1 ] || { echo "::error::expected exactly one '... AS runtime' stage in $src"; exit 1; }
+          # Same workspace set the Dockerfile installed, minus `server` (the builder rm -rf's it).
+          ws=$(grep -o -- '--workspace=[^ ]*' "$src" | grep -vx -- '--workspace=server' | sort -u | tr '\n' ' ')
+          [ -n "$ws" ] || { echo "::error::no --workspace flags found in $src"; exit 1; }
+          # npm resolves every workspace manifest on disk. The builder later COPYs all of packages/, whose
+          # extra manifests (e.g. packages/emulators/threecx -> @alga-psa/ee-threecx, not in the context)
+          # make prune hit the registry and 404. Hide every manifest the Dockerfile did NOT copy before
+          # its install, prune, then restore them.
+          keep=$(grep -oE '^COPY [^ ]+/package\.json ' "$src" | awk '{print $2}' | tr '\n' ' ')
+          [ -n "$keep" ] || { echo "::error::no pre-install package.json COPYs found in $src"; exit 1; }
+          cat > "$RUNNER_TEMP/stage" <<EOF
+          # opsilient: drop devDependencies (and the npm cache) before the runtime COPY
+          FROM builder AS opsilient-pruned
+          WORKDIR /app
+          RUN set -e; keep=" $keep "; \
+              find . -mindepth 2 -path '*/node_modules' -prune -o -name package.json -print | sed 's|^\./||' \
+                | while read -r f; do case "\$keep" in *" \$f "*) ;; *) mv "\$f" "\$f.opsilient-hidden";; esac; done; \
+              npm prune --omit=dev --include-workspace-root $ws; \
+              $NM_TRIM; \
+              find . -path '*/node_modules' -prune -o -name package.json.opsilient-hidden -print | while read -r f; do mv "\$f" "\${f%.opsilient-hidden}"; done; \
+              npm cache clean --force; rm -rf /root/.npm /tmp/*
+
+          EOF
+          awk -v stagefile="$RUNNER_TEMP/stage" '
+            /^FROM .+ AS runtime$/ { while ((getline l < stagefile) > 0) print l }
+            $0 == "COPY --from=builder /app /app" { print "COPY --from=opsilient-pruned /app /app"; next }
+            { print }' "$src" > "$df"
+          diff "$src" "$df" || true
+          docker build -f "$df" --label "$LABEL" -t "$IMG" .
+
+      # ---- temporal-worker: flatten the production target into a single layer ----
+      - name: "flatten: build production target, then squash it into one layer"
+        if: matrix.slim == 'flatten'
+        run: |
+          set -euo pipefail
+          src="${{ matrix.file }}"
+          grep -qE '^FROM .+ AS production$' "$src" || { echo "::error::production stage not found in $src"; exit 1; }
+          { cat "$src"; cat <<'EOF'
+          # opsilient: drop the npm download cache before flattening
+          FROM production AS opsilient-trim
+          USER root
+          RUN rm -rf /root/.npm /tmp/*
+          EOF
+          } > "$RUNNER_TEMP/Dockerfile.trim"
+          docker build -f "$RUNNER_TEMP/Dockerfile.trim" --target opsilient-trim -t opsilient-src .
+          # Re-declare the production stage's config (USER is the production one, not the trim's root).
+          docker image inspect opsilient-src --format '{{json .Config}}' > "$RUNNER_TEMP/cfg.json"
+          docker image inspect "$(docker build -q -f "$src" --target production .)" --format '{{json .Config.User}}' > "$RUNNER_TEMP/user.json"
+          {
+            echo 'FROM opsilient-src AS src'
+            echo 'FROM scratch'
+            echo 'COPY --from=src / /'
+            jq -r --slurpfile u "$RUNNER_TEMP/user.json" '
+              def secs: (. / 1000000000 | floor | tostring) + "s";
+              ((.Env // [])[] | capture("^(?<k>[^=]+)=(?<v>.*)$") | "ENV \(.k)=\(.v | tojson)"),
+              ((.ExposedPorts // {}) | keys[] | "EXPOSE \(.)"),
+              (if (.WorkingDir // "") != "" then "WORKDIR \(.WorkingDir)" else empty end),
+              (if .Healthcheck then .Healthcheck as $h
+                 | "HEALTHCHECK --interval=\($h.Interval | secs) --timeout=\($h.Timeout | secs) --start-period=\($h.StartPeriod | secs) --retries=\($h.Retries) CMD "
+                   + (if $h.Test[0] == "CMD-SHELL" then $h.Test[1] else ($h.Test[1:] | tojson) end)
+               else empty end),
+              (if .Entrypoint then "ENTRYPOINT \(.Entrypoint | tojson)" else empty end),
+              (if .Cmd then "CMD \(.Cmd | tojson)" else empty end),
+              (if ($u[0] // "") != "" then "USER \($u[0])" else empty end)
+            ' "$RUNNER_TEMP/cfg.json"
+          } > "$RUNNER_TEMP/Dockerfile.flat"
+          cat "$RUNNER_TEMP/Dockerfile.flat"
+          docker build -f "$RUNNER_TEMP/Dockerfile.flat" --label "$LABEL" -t "$IMG" "$RUNNER_TEMP"
+
+      # ---- smoke tests: fail before push if the slim image cannot load its runtime ----
+      - name: Smoke test
+        run: |
+          set +e -uo pipefail
+          bad='Cannot find module|ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND|ERR_PACKAGE_PATH_NOT_EXPORTED|ERR_DLOPEN_FAILED|command not found|: not found|No such file'
+          fail=0
+          # run <label> <shell script>: runs inside the image with junk DB/Redis/Temporal endpoints;
+          # connection errors are expected, module-resolution errors fail the job.
+          run() {
+            echo "::group::$1"
+            out=$(docker run --rm --entrypoint sh \
+              -e DB_HOST=127.0.0.1 -e DB_PORT=1 -e REDIS_HOST=127.0.0.1 -e REDIS_PORT=1 \
+              -e TEMPORAL_ADDRESS=127.0.0.1:1 -e NODE_ENV=production "$IMG" -c "$2" 2>&1)
+            rc=$?
+            printf '%s\n' "$out" | tail -40
+            echo "::endgroup::"
+            if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 143 ] && [ "${3:-}" != allow-exit ]; then
+              echo "::error::$1: exit $rc"; fail=1
+            fi
+            if printf '%s\n' "$out" | grep -Eq "$bad"; then
+              echo "::error::$1: module/file resolution error"; printf '%s\n' "$out" | grep -E "$bad" | head -5; fail=1
+            fi
+          }
+          case "${{ matrix.name }}" in
+            alga-psa-ee)
+              run files 'set -e; cd /app/server; for f in setup/create_database.js knexfile.cjs scripts/create-tenant.ts .next/BUILD_ID next.config.mjs /app/entrypoint.sh /app/packages/core/dist/index.js /app/packages/db/dist/index.js; do test -e "$f" || { echo "No such file: $f"; exit 1; }; done; test -d migrations/utils; ls migrations | wc -l'
+              run modules 'cd /app/server && node -e "for (const m of [\"next\",\"knex\",\"pg\",\"react\",\"react-dom\"]) require.resolve(m); console.log(\"ok\")" && npx --no-install knex --version && npx --no-install tsx --version'
+              run setup-create-db 'cd /app/server && timeout 20 node setup/create_database.js' allow-exit
+              # Tenant bootstrap: upstream's helm bootstrap runs appliance-create-tenant.mjs (Temporal client
+              # only); it must get as far as its own input validation.
+              run appliance-create-tenant 'cd /app/server && timeout 20 node scripts/appliance-create-tenant.mjs; echo "exit $?"' allow-exit
+              # server/scripts/create-tenant.ts via tsx does not load in upstream's images either (the old
+              # Dockerfile.build image: missing ee/server/src; vendor packaging: @alga-psa/db exports are
+              # import-only) -- logged for information, not gated.
+              docker run --rm --entrypoint sh "$IMG" -c 'cd /app && timeout 60 npx --no-install tsx server/scripts/create-tenant.ts --help 2>&1 | grep -m3 -E "Error|Usage"' || true
+              run next-start 'cd /app/server && (timeout 60 npx --no-install next start -p 3000 &) ; for i in $(seq 1 30); do sleep 2; curl -s -o /dev/null -w "HTTP %{http_code}\n" --max-time 20 http://127.0.0.1:3000/auth/signin && break; done; curl -s -o /dev/null -w "HTTP %{http_code}\n" --max-time 20 http://127.0.0.1:3000/api/healthz; curl -sf -o /dev/null --max-time 20 http://127.0.0.1:3000/auth/signin || { echo "next did not serve /auth/signin"; exit 1; }; sleep 3'
+              ;;
+            alga-workflow-worker)
+              run node-resolve 'cd /app/services/workflow-worker && node -e "for (const m of [\"@temporalio/worker\",\"knex\",\"pg\",\"redis\",\"openai\"]) require.resolve(m); console.log(\"ok\")"'
+              run activities-load 'cd /app/ee/temporal-workflows && node --input-type=module -e "await import(\"./dist/ee/temporal-workflows/src/activities/workflow-runtime-v2-activities.js\"); console.log(\"ok\")"'
+              run worker-start 'cd /app/services/workflow-worker && timeout 30 npm run start' allow-exit
+              ;;
+            alga-email-service)
+              run node-resolve 'cd /app/services/email-service && node -e "for (const m of [\"knex\",\"pg\"]) require.resolve(m); console.log(\"ok\")"'
+              run service-start 'timeout 30 sh /app/entrypoint.sh' allow-exit
+              ;;
+            alga-temporal-worker)
+              run core-bridge 'cd /app/ee/temporal-workflows && whoami && node -e "require(\"@temporalio/worker\"); require(\"@temporalio/core-bridge\"); console.log(\"ok\")"'
+              run seeds-db 'cd /app/ee/temporal-workflows && node --input-type=module -e "const m = await import(\"@alga-psa/db\"); if (typeof m.tenantDb !== \"function\") throw new Error(\"tenantDb missing\"); console.log(\"ok\")"'
+              run activities-load 'cd /app/ee/temporal-workflows && f=dist/ee/temporal-workflows/src/activities/index.js; test -f $f || { echo "No such file: $f"; exit 1; }; node --input-type=module -e "await import(\"./$f\"); console.log(\"ok\")"'
+              run worker-start 'cd /app/ee/temporal-workflows && timeout 30 node dist/ee/temporal-workflows/src/worker.js' allow-exit
+              docker image inspect "$IMG" --format 'user={{.Config.User}} workdir={{.Config.WorkingDir}} cmd={{json .Config.Cmd}} healthcheck={{json .Config.Healthcheck.Test}}'
+              ;;
+          esac
+          exit $fail
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - id: push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ${{ matrix.file }}
-          target: ${{ matrix.target }}
-          platforms: linux/arm64
-          push: true
-          provenance: false
-          tags: ghcr.io/opsilient/${{ matrix.name }}:${{ env.SHORT_TAG }}
-          build-args: ${{ matrix.build_args }}
-          labels: |
-            org.opencontainers.image.revision=${{ inputs.ref }}
-      - name: Report digest and compressed size
+      - name: Push and report sizes
         run: |
-          img="ghcr.io/opsilient/${{ matrix.name }}"
-          digest="${{ steps.push.outputs.digest }}"
-          size=$(docker buildx imagetools inspect --raw "$img@$digest" | jq '[.layers[].size] | add')
-          echo "${{ matrix.name }}:${SHORT_TAG}@${digest} compressed=${size} bytes" >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          docker push -q "$IMG"
+          size=$(docker image inspect -f '{{.Size}}' "$IMG")
+          comp=$(docker buildx imagetools inspect --raw "$IMG" | jq '[.layers[].size] | add')
+          digest=$(docker image inspect -f '{{index .RepoDigests 0}}' "$IMG")
+          docker history "$IMG" --format '{{.Size}}\t{{.CreatedBy}}' | cut -c1-160 | head -40
+          awk -v d="$digest" -v u="$size" -v c="$comp" 'BEGIN { printf "%s uncompressed=%.2f GB compressed=%.2f GB\n", d, u/1e9, c/1e9 }' | tee -a "$GITHUB_STEP_SUMMARY"
