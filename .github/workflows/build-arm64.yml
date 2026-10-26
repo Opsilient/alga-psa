@@ -255,15 +255,17 @@ jobs:
               ;;
             alga-workflow-worker)
               run node-resolve 'cd /app/services/workflow-worker && node -e "for (const m of [\"@temporalio/worker\",\"knex\",\"pg\",\"redis\",\"openai\"]) require.resolve(m); console.log(\"ok\")"'
-              run worker-start 'cd /app/services/workflow-worker && timeout 30 npm run start'
+              run activities-load 'cd /app/ee/temporal-workflows && node --input-type=module -e "await import(\"./dist/ee/temporal-workflows/src/activities/workflow-runtime-v2-activities.js\"); console.log(\"ok\")"'
+              run worker-start 'cd /app/services/workflow-worker && timeout 30 npm run start' allow-exit
               ;;
             alga-email-service)
               run node-resolve 'cd /app/services/email-service && node -e "for (const m of [\"knex\",\"pg\"]) require.resolve(m); console.log(\"ok\")"'
-              run service-start 'timeout 30 sh /app/entrypoint.sh'
+              run service-start 'timeout 30 sh /app/entrypoint.sh' allow-exit
               ;;
             alga-temporal-worker)
               run core-bridge 'cd /app/ee/temporal-workflows && whoami && node -e "require(\"@temporalio/worker\"); require(\"@temporalio/core-bridge\"); console.log(\"ok\")"'
               run seeds-db 'cd /app/ee/temporal-workflows && node --input-type=module -e "const m = await import(\"@alga-psa/db\"); if (typeof m.tenantDb !== \"function\") throw new Error(\"tenantDb missing\"); console.log(\"ok\")"'
+              run activities-load 'cd /app/ee/temporal-workflows && f=dist/ee/temporal-workflows/src/activities/index.js; test -f $f || { echo "No such file: $f"; exit 1; }; node --input-type=module -e "await import(\"./$f\"); console.log(\"ok\")"'
               run worker-start 'cd /app/ee/temporal-workflows && timeout 30 node dist/ee/temporal-workflows/src/worker.js' allow-exit
               docker image inspect "$IMG" --format 'user={{.Config.User}} workdir={{.Config.WorkingDir}} cmd={{json .Config.Cmd}} healthcheck={{json .Config.Healthcheck.Test}}'
               ;;
