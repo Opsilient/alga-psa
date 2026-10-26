@@ -171,7 +171,7 @@ jobs:
           RUN set -e; keep=" $keep "; \
               find . -mindepth 2 -path '*/node_modules' -prune -o -name package.json -print | sed 's|^\./||' \
                 | while read -r f; do case "\$keep" in *" \$f "*) ;; *) mv "\$f" "\$f.opsilient-hidden";; esac; done; \
-              npm prune --omit=dev --include-workspace-root $ws; \
+              npm prune --omit=dev $ws; \
               find . -path '*/node_modules' -prune -o -name package.json.opsilient-hidden -print | while read -r f; do mv "\$f" "\${f%.opsilient-hidden}"; done; \
               npm cache clean --force; rm -rf /root/.npm /tmp/*
 
@@ -284,4 +284,5 @@ jobs:
           comp=$(docker buildx imagetools inspect --raw "$IMG" | jq '[.layers[].size] | add')
           digest=$(docker image inspect -f '{{index .RepoDigests 0}}' "$IMG")
           docker history "$IMG" --format '{{.Size}}\t{{.CreatedBy}}' | cut -c1-160 | head -40
+          docker run --rm --entrypoint sh -u 0 "$IMG" -c 'du -xs /app/* /app/node_modules/* /app/node_modules/@*/* /app/*/*/node_modules 2>/dev/null | sort -n | tail -25' || true
           awk -v d="$digest" -v u="$size" -v c="$comp" 'BEGIN { printf "%s uncompressed=%.2f GB compressed=%.2f GB\n", d, u/1e9, c/1e9 }' | tee -a "$GITHUB_STEP_SUMMARY"
