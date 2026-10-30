@@ -305,7 +305,7 @@ jobs:
               # import-only) -- logged for information, not gated.
               docker run --rm --entrypoint sh "$IMG" -c 'cd /app && timeout 60 npx --no-install tsx server/scripts/create-tenant.ts --help 2>&1 | grep -m3 -E "Error|Usage"' || true
               # Self-registration guard must be in the compiled server the runtime executes (.next/server).
-              run selfreg-guard 'set -e; cd /app/server/.next/server; for n in registerUser verifyRegisterUser; do c=$(grep -rlF "OPSILIENT_SELF_REGISTRATION_GUARD: $n refused" . | wc -l); echo "$n guard in $c compiled file(s)"; [ "$c" -gt 0 ] || { echo "guard missing for $n"; exit 1; }; done; c=$(grep -rlF "OPSILIENT_SELF_REGISTRATION_GUARD: initiateRegistration refused" . | wc -l); echo "initiateRegistration guard in $c compiled file(s) (0 = not bundled)"'
+              run selfreg-guard 'set -e; cd /app/server/.next/server; for n in registerUser verifyRegisterUser initiateRegistration; do c=$(grep -rlF "OPSILIENT_SELF_REGISTRATION_GUARD: $n refused" . | wc -l); echo "$n guard in $c compiled file(s)"; [ "$c" -gt 0 ] || { echo "guard missing for $n"; exit 1; }; done'
               run next-start 'cd /app/server && (timeout 60 npx --no-install next start -p 3000 &) ; for i in $(seq 1 30); do sleep 2; curl -s -o /dev/null -w "HTTP %{http_code}\n" --max-time 20 http://127.0.0.1:3000/auth/signin && break; done; curl -s -o /dev/null -w "HTTP %{http_code}\n" --max-time 20 http://127.0.0.1:3000/api/healthz; curl -sf -o /dev/null --max-time 20 http://127.0.0.1:3000/auth/signin || { echo "next did not serve /auth/signin"; exit 1; }; sleep 3'
               ;;
             alga-workflow-worker)
