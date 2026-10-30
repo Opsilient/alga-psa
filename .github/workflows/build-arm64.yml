@@ -2,7 +2,8 @@
 # Builds straight from the Nine-Minds/alga-psa commit/tag given as input; this fork's own tree
 # is not used. All four packages must stay PRIVATE on GHCR (the EE licence forbids distribution).
 #
-# The upstream tree is never modified except for one guarded in-tree patch: the workflow-worker
+# The upstream tree is never modified except for guarded in-tree patches: the alga-psa-ee
+# self-registration guard (see its step), and the workflow-worker
 # Dockerfile gets NODE_OPTIONS=--max-old-space-size=4096 in its builder stage (tsc OOMs at node's
 # default ~2 GB; upstream sets no heap size and takes no build arg). Every other slimming step works on
 # Dockerfile COPIES in $RUNNER_TEMP (upstream file + a few appended/inserted lines), so the vendor's
@@ -104,6 +105,45 @@ jobs:
             sed -i '1a ENV NODE_OPTIONS=--max-old-space-size=4096' services/workflow-worker/Dockerfile
             head -3 services/workflow-worker/Dockerfile
           fi
+
+      # Self-registration guard (security). Upstream's public /auth/register server actions create a
+      # tenant + superadmin with no auth when email verification is off, and the contact-registration
+      # actions create portal users with no proof of email ownership. Server actions are callable by
+      # POSTing their action ID to any page, so a proxy block on the page path is not enough. Each guarded
+      # function refuses (its own failure shape + a warning) unless ALGA_SELF_REGISTRATION=on at runtime.
+      # Fails the job if any expected signature is missing or ambiguous, so an upstream change cannot
+      # silently drop the guard. First-tenant bootstrap (appliance-create-tenant.mjs -> Temporal
+      # tenantCreationWorkflow in the temporal-worker image) never calls these functions.
+      - name: "ee: patch self-registration guard (ALGA_SELF_REGISTRATION=on to re-enable)"
+        if: matrix.slim == 'ee-package'
+        run: |
+          set -euo pipefail
+          # guard <file> <function's first line> <line that opens its body, '' = the first line> <name> <failure return>
+          # Inserts the guard right after the body-opening line of the one function that starts at <first line>.
+          guard() {
+            local f=$1 start=$2 open=${3:-$2} name=$4 ret=$5 n
+            n=$(grep -cxF -- "$start" "$f" || true)
+            [ "$n" = 1 ] || { echo "::error::$f: expected exactly one line '$start' for $name, found $n"; exit 1; }
+            local g="  if (process.env['ALGA_SELF_REGISTRATION'] !== 'on') { console.warn('OPSILIENT_SELF_REGISTRATION_GUARD: $name refused (set ALGA_SELF_REGISTRATION=on to allow self-registration)'); return $ret; }"
+            START="$start" OPEN="$open" G="$g" awk '
+              $0 == ENVIRON["START"] { armed = 1; gap = 0 }
+              { print }
+              armed && $0 == ENVIRON["OPEN"] { print ENVIRON["G"]; armed = 0; next }
+              armed && ++gap > 4 { armed = 0 }' "$f" > "$f.tmp"
+            mv "$f.tmp" "$f"
+            [ "$(grep -cF "OPSILIENT_SELF_REGISTRATION_GUARD: $name refused" "$f")" = 1 ] || { echo "::error::$f: guard for $name not applied (body did not open with '$open' within 3 lines)"; exit 1; }
+            grep -nF -A4 -- "$start" "$f" | grep -B4 -m1 OPSILIENT_SELF_REGISTRATION_GUARD
+          }
+          reg=packages/auth/src/actions/useRegister.tsx
+          guard "$reg" 'export async function verifyRegisterUser(token: string): Promise<VerifyResponse> {' '' verifyRegisterUser \
+            "{ message: 'Self-registration is disabled', wasSuccess: false }"
+          guard "$reg" 'export async function registerUser({ username, email, password, clientName }: IUserRegister): Promise<boolean> {' '' registerUser false
+          # Contact-based portal registration (two copies, multi-line signature).
+          for f in packages/auth/src/lib/registrationHelpers.ts packages/users/src/actions/user-actions/registrationActions.ts; do
+            guard "$f" 'export async function initiateRegistration(' '): Promise<IRegistrationResult> {' initiateRegistration \
+              "{ success: false, error: 'Self-registration is disabled. Please contact your administrator.' }"
+          done
+          git diff --stat
 
       # ---- alga-psa-ee: compile with Dockerfile.build, package with the vendor's ee/server/Dockerfile ----
       - name: "ee: compile (Dockerfile.build builder stage) and export the build outputs"
@@ -264,6 +304,8 @@ jobs:
               # Dockerfile.build image: missing ee/server/src; vendor packaging: @alga-psa/db exports are
               # import-only) -- logged for information, not gated.
               docker run --rm --entrypoint sh "$IMG" -c 'cd /app && timeout 60 npx --no-install tsx server/scripts/create-tenant.ts --help 2>&1 | grep -m3 -E "Error|Usage"' || true
+              # Self-registration guard must be in the compiled server the runtime executes (.next/server).
+              run selfreg-guard 'set -e; cd /app/server/.next/server; for n in registerUser verifyRegisterUser; do c=$(grep -rlF "OPSILIENT_SELF_REGISTRATION_GUARD: $n refused" . | wc -l); echo "$n guard in $c compiled file(s)"; [ "$c" -gt 0 ] || { echo "guard missing for $n"; exit 1; }; done; c=$(grep -rlF "OPSILIENT_SELF_REGISTRATION_GUARD: initiateRegistration refused" . | wc -l); echo "initiateRegistration guard in $c compiled file(s) (0 = not bundled)"'
               run next-start 'cd /app/server && (timeout 60 npx --no-install next start -p 3000 &) ; for i in $(seq 1 30); do sleep 2; curl -s -o /dev/null -w "HTTP %{http_code}\n" --max-time 20 http://127.0.0.1:3000/auth/signin && break; done; curl -s -o /dev/null -w "HTTP %{http_code}\n" --max-time 20 http://127.0.0.1:3000/api/healthz; curl -sf -o /dev/null --max-time 20 http://127.0.0.1:3000/auth/signin || { echo "next did not serve /auth/signin"; exit 1; }; sleep 3'
               ;;
             alga-workflow-worker)
