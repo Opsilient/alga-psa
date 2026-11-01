@@ -82,6 +82,12 @@ jobs:
           repository: Nine-Minds/alga-psa
           ref: ${{ inputs.ref }}
           persist-credentials: false
+      # next build gets a 12 GB heap on a 16 GB runner; swap keeps the runner agent alive, the compile step logs memory use.
+      - name: "ee: add swap"
+        if: matrix.slim == 'ee-package'
+        run: |
+          sudo fallocate -l 16G /swap-ee && sudo chmod 600 /swap-ee && sudo mkswap /swap-ee && sudo swapon /swap-ee
+          free -m
       - name: Free disk space (EE build needs 10+ GB intermediate)
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
@@ -109,6 +115,7 @@ jobs:
       - name: "ee: compile (Dockerfile.build builder stage) and export the build outputs"
         if: matrix.slim == 'ee-package'
         run: |
+          (while :; do echo "MEM $(date -u +%T) $(free -m | awk 'NR>1{printf "%s %s/%s ", $1, $3, $2}')"; sleep 30; done) &
           set -euo pipefail
           grep -qx 'FROM deps AS builder' "${{ matrix.file }}" || { echo "::error::builder stage not found in ${{ matrix.file }}"; exit 1; }
           df="$RUNNER_TEMP/Dockerfile.ee-artifacts"
