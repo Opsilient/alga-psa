@@ -51,6 +51,7 @@ jobs:
       - id: plan
         env:
           IMAGES: ${{ inputs.images }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           all='[
             {"name":"alga-psa-ee",          "file":"ee/server/Dockerfile.build",         "slim":"ee-package"},
@@ -64,10 +65,22 @@ jobs:
           [ "$unknown" = "[]" ] || { echo "unknown image(s): $unknown" >&2; exit 1; }
           [ "$want" != "[]" ] || { echo "images input is empty" >&2; exit 1; }
           matrix=$(jq -c --argjson w "$want" '{include: map(select(.name as $n | $w | index($n)))}' <<<"$all")
+          # A-261119-26: hocuspocus is built only when hocuspocus/ changed (its Dockerfile uses nothing else).
+          # Tag = tree hash of hocuspocus/ at the ref; if that tag is already in GHCR, skip and keep its digest.
+          if jq -e 'index("alga-hocuspocus")' <<<"$want" >/dev/null; then
+            T=$(gh api "repos/Nine-Minds/alga-psa/contents/?ref=${{ inputs.ref }}" --jq '.[] | select(.name=="hocuspocus") | .sha' | cut -c1-8)
+            [ -n "$T" ] || { echo "::error::hocuspocus tree not found at ref"; exit 1; }
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+            if docker manifest inspect "ghcr.io/opsilient/alga-hocuspocus:src-$T${{ inputs.tag_suffix }}" >/dev/null 2>&1; then
+              echo "::notice::hocuspocus/ unchanged (src-$T already built); skipping"
+              matrix=$(jq -c '.include |= map(select(.name != "alga-hocuspocus"))' <<<"$matrix")
+            fi
+          fi
           echo "building: $matrix"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
   build:
     needs: plan
+    if: ${{ !endsWith(needs.plan.outputs.matrix, '"include":[]}') }}
     runs-on: ubuntu-24.04-arm
     strategy:
       fail-fast: false
@@ -106,6 +119,8 @@ jobs:
         run: |
           [[ "$SUFFIX" =~ ^[A-Za-z0-9._-]*$ ]] || { echo "bad tag_suffix" >&2; exit 1; }
           echo "IMG=ghcr.io/opsilient/${{ matrix.name }}:$(git rev-parse --short=8 HEAD)$SUFFIX" >> "$GITHUB_ENV"
+          # hocuspocus: content tag (tree hash of hocuspocus/), checked by the plan job to skip unchanged builds
+          [ "${{ matrix.name }}" != alga-hocuspocus ] || echo "IMG=ghcr.io/opsilient/alga-hocuspocus:src-$(git rev-parse --short=8 HEAD:hocuspocus)$SUFFIX" >> "$GITHUB_ENV"
       - name: Patch workflow-worker builder heap (tsc OOMs at default 2 GB)
         if: matrix.name == 'alga-workflow-worker'
         run: |
