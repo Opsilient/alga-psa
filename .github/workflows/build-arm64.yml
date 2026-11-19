@@ -31,7 +31,7 @@ on:
         required: true
         default: "016e0afc88fb784587b3ebe51fc64a2d30ffc0a9"
       images:
-        description: "comma-separated subset of: alga-psa-ee,alga-workflow-worker,alga-email-service,alga-temporal-worker"
+        description: "comma-separated subset of: alga-psa-ee,alga-workflow-worker,alga-email-service,alga-temporal-worker,alga-hocuspocus"
         required: true
         default: "alga-psa-ee,alga-workflow-worker,alga-email-service,alga-temporal-worker"
       tag_suffix:
@@ -56,7 +56,8 @@ jobs:
             {"name":"alga-psa-ee",          "file":"ee/server/Dockerfile.build",         "slim":"ee-package"},
             {"name":"alga-workflow-worker", "file":"services/workflow-worker/Dockerfile", "slim":"prune"},
             {"name":"alga-email-service",   "file":"services/email-service/Dockerfile",   "slim":"prune"},
-            {"name":"alga-temporal-worker", "file":"ee/temporal-workflows/Dockerfile",    "slim":"flatten"}
+            {"name":"alga-temporal-worker", "file":"ee/temporal-workflows/Dockerfile",    "slim":"flatten"},
+            {"name":"alga-hocuspocus",      "file":"hocuspocus/Dockerfile",               "slim":"plain"}
           ]'
           want=$(printf '%s' "$IMAGES" | tr -d ' \n' | jq -Rsc 'split(",") | map(select(. != ""))')
           unknown=$(jq -nc --argjson w "$want" --argjson a "$all" '$w - ($a | map(.name))')
@@ -248,6 +249,11 @@ jobs:
           cat "$RUNNER_TEMP/Dockerfile.flat"
           docker build -f "$RUNNER_TEMP/Dockerfile.flat" --label "$LABEL" -t "$IMG" "$RUNNER_TEMP"
 
+      # ---- hocuspocus: upstream's own Dockerfile, unchanged (root context; it COPYs hocuspocus/ paths) ----
+      - name: "plain: build the vendor Dockerfile as is"
+        if: matrix.slim == 'plain'
+        run: docker build -f "${{ matrix.file }}" --label "$LABEL" -t "$IMG" .
+
       # ---- smoke tests: fail before push if the slim image cannot load its runtime ----
       - name: Smoke test
         run: |
@@ -300,6 +306,10 @@ jobs:
               run activities-load 'cd /app/ee/temporal-workflows && f=dist/ee/temporal-workflows/src/activities/index.js; test -f $f || { echo "No such file: $f"; exit 1; }; node --input-type=module -e "await import(\"./$f\"); console.log(\"ok\")"'
               run worker-start 'cd /app/ee/temporal-workflows && timeout 30 node dist/ee/temporal-workflows/src/worker.js' allow-exit
               docker image inspect "$IMG" --format 'user={{.Config.User}} workdir={{.Config.WorkingDir}} cmd={{json .Config.Cmd}} healthcheck={{json .Config.Healthcheck.Test}}'
+              ;;
+            alga-hocuspocus)
+              run files 'cd /app/hocuspocus && for f in server.js entrypoint.sh hocuspocusJwtSecret.js node_modules/@hocuspocus/server/package.json; do test -e "$f" || { echo "No such file: $f"; exit 1; }; done; echo ok'
+              run modules 'cd /app/hocuspocus && node --input-type=module -e "await import(\"@hocuspocus/server\"); await import(\"@hocuspocus/extension-redis\"); await import(\"jsonwebtoken\"); await import(\"redis\"); await import(\"pg\"); await import(\"yjs\"); console.log(\"ok\")"'
               ;;
           esac
           exit $fail
