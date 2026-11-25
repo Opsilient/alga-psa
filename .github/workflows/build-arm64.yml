@@ -166,7 +166,7 @@ jobs:
           { awk -v i="$install" -v t="$NM_TRIM" '$0 == i { print $0 " && " t; next } { print }' ee/server/Dockerfile; cat <<'EOF'
           # opsilient: parity with ee/server/Dockerfile.build's runtime stage
           ENV NEXT_PUBLIC_EDITION=enterprise SECRET_READ_CHAIN="env,filesystem" SECRET_WRITE_PROVIDER="filesystem"
-          RUN sed -i 's/NEXT_PUBLIC_EDITION=community/NEXT_PUBLIC_EDITION=enterprise/' /app/.env /app/server/.env
+          RUN sed -i 's/NEXT_PUBLIC_EDITION=community/NEXT_PUBLIC_EDITION=enterprise/' /app/.env /app/server/.env 2>/dev/null || true
           EOF
           } > "$df"
           docker build -f "$df" --label "$LABEL" -t "$IMG" .
